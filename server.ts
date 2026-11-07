@@ -1,7 +1,8 @@
-// bb-plugin-idle-inhibit — inhibits idle on the machine running bb through
-// D-Bus. Registered from the composer toggle in app.tsx.
+// bb-plugin-idle-inhibit — blocks system suspend through systemd-logind while
+// the composer toggle is on. Screen blanking is untouched: the inhibitor lock
+// is `sleep`, not `idle`.
+import { spawn, type ChildProcess } from "node:child_process";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { Message, sessionBus, type MessageBus } from "dbus-next";
 import { z } from "zod";
 
 const statusSchema = z.object({
@@ -12,68 +13,29 @@ const statusSchema = z.object({
 export type InhibitStatus = z.infer<typeof statusSchema>;
 
 export const rpcContract = defineRpcContract({
-  idle_status: {
+  suspend_status: {
     input: z.null(),
     output: statusSchema,
   },
-  idle_set_enabled: {
+  suspend_set_enabled: {
     input: z.object({ enabled: z.boolean() }).strict(),
     output: statusSchema,
   },
 });
 
-const CHANGED = "idle-inhibit-changed";
-const APPLICATION = "bb-plugin-idle-inhibit";
-const REASON = "bb is keeping this machine awake";
+const CHANGED = "suspend-inhibit-changed";
+const WHO = "bb-plugin-idle-inhibit";
+const WHY = "bb is keeping this machine awake";
+/** Time systemd-inhibit gets to acquire the lock before we call it running. */
+const READY_MS = 300;
+/** Grace periods when stopping the lock holder. */
+const END_STDIN_MS = 2_000;
+const TERM_MS = 1_000;
+const KILL_MS = 1_000;
 
-interface Backend {
-  id: string;
-  service: string;
-  path: string;
-  interface: string;
-  inhibitSignature: string;
-  inhibitArgs: unknown[];
-  releaseMember: string;
-}
-
-// Tried in order. ScreenSaver covers KDE, Cinnamon and idle daemons such as
-// hypridle/swayidle that expose the freedesktop interface; GNOME SessionManager
-// and the freedesktop PowerManagement interface cover the remaining desktops.
-const BACKENDS: readonly Backend[] = [
-  {
-    id: "ScreenSaver",
-    service: "org.freedesktop.ScreenSaver",
-    path: "/org/freedesktop/ScreenSaver",
-    interface: "org.freedesktop.ScreenSaver",
-    inhibitSignature: "ss",
-    inhibitArgs: [APPLICATION, REASON],
-    releaseMember: "UnInhibit",
-  },
-  {
-    id: "GNOME",
-    service: "org.gnome.SessionManager",
-    path: "/org/gnome/SessionManager",
-    interface: "org.gnome.SessionManager",
-    // app id, toplevel xid, reason, flags (8 = inhibit idle)
-    inhibitSignature: "susu",
-    inhibitArgs: [APPLICATION, 0, REASON, 8],
-    releaseMember: "Uninhibit",
-  },
-  {
-    id: "PowerManagement",
-    service: "org.freedesktop.PowerManagement",
-    path: "/org/freedesktop/PowerManagement/Inhibit",
-    interface: "org.freedesktop.PowerManagement.Inhibit",
-    inhibitSignature: "ss",
-    inhibitArgs: [APPLICATION, REASON],
-    releaseMember: "UnInhibit",
-  },
-];
-
-interface StoredState {
-  enabled: boolean;
-  backend: string | null;
-  cookie: number | null;
+interface Inhibitor {
+  child: ChildProcess;
+  exited: Promise<void>;
 }
 
 const STATE_KEY = "state";
@@ -82,21 +44,27 @@ function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-function messageBody(reply: Message | null): unknown[] {
-  if (reply === null) throw new Error("D-Bus method returned no reply");
-  return reply.body;
+function isRunning(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+function waitFor(promise: Promise<unknown>, milliseconds: number): Promise<boolean> {
+  const { promise: settled, resolve } = Promise.withResolvers<boolean>();
+  const timer = setTimeout(() => resolve(false), milliseconds);
+  void promise.then(() => {
+    clearTimeout(timer);
+    resolve(true);
+  });
+  return settled;
 }
 
 export default async function plugin(bb: BbPluginApi) {
-  let bus: MessageBus | null = null;
   let enabled = false;
-  let backend: string | null = null;
-  let cookie: number | null = null;
+  let inhibitor: Inhibitor | null = null;
   let error: string | null = null;
   let chain: Promise<unknown> = Promise.resolve();
 
-  // One D-Bus call at a time: rapid toggles must not race an Inhibit against
-  // an UnInhibit, or leave a cookie we no longer track.
+  // One transition at a time: a toggle must never race a reload's stop.
   function serialize<T>(operation: () => Promise<T>): Promise<T> {
     const result = chain.then(operation, operation);
     chain = result.then(
@@ -106,150 +74,136 @@ export default async function plugin(bb: BbPluginApi) {
     return result;
   }
 
-  function ensureBus(): MessageBus {
-    if (bus === null) {
-      const created = sessionBus();
-      created.on("error", (cause: unknown) => {
-        bb.log.warn(`session bus error: ${describe(cause)}`);
-        if (bus === created) bus = null;
-      });
-      bus = created;
-    }
-    return bus;
-  }
-
-  async function call(
-    target: Backend,
-    member: string,
-    signature: string,
-    body: unknown[],
-  ): Promise<unknown[]> {
-    const reply = await ensureBus().call(
-      new Message({
-        destination: target.service,
-        path: target.path,
-        interface: target.interface,
-        member,
-        signature,
-        body,
-      }),
-    );
-    return messageBody(reply);
-  }
-
-  async function acquire(): Promise<{ backend: string; cookie: number }> {
-    const failures: string[] = [];
-    for (const target of BACKENDS) {
-      try {
-        const body = await call(
-          target,
-          "Inhibit",
-          target.inhibitSignature,
-          target.inhibitArgs,
-        );
-        const value = body[0];
-        if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-          throw new Error(`unexpected inhibit cookie ${String(value)}`);
-        }
-        return { backend: target.id, cookie: value };
-      } catch (cause) {
-        failures.push(`${target.id}: ${describe(cause)}`);
-      }
-    }
-    throw new Error(
-      `No idle-inhibit D-Bus service accepted the request (${failures.join("; ")})`,
-    );
-  }
-
-  async function release(
-    targetId: string | null,
-    value: number,
-  ): Promise<void> {
-    const target = BACKENDS.find((candidate) => candidate.id === targetId);
-    if (target === undefined) return;
-    await call(target, target.releaseMember, "u", [value]);
-  }
-
   async function persist(): Promise<void> {
-    await bb.storage.kv.set(STATE_KEY, { enabled, backend, cookie } satisfies StoredState);
+    await bb.storage.kv.set(STATE_KEY, { enabled } satisfies { enabled: boolean });
   }
 
   function snapshot(): InhibitStatus {
-    return { enabled, backend, error };
+    return { enabled, backend: enabled ? "logind" : null, error };
   }
 
-  // A cookie from an earlier generation (or a crashed server) may still hold
-  // an inhibitor. Acquire the replacement first, then drop the old cookie, so
-  // a reload never leaves a window without inhibition.
-  const stored = await bb.storage.kv.get<StoredState>(STATE_KEY);
+  async function start(): Promise<Inhibitor> {
+    // `cat` inherits a pipe held by this process. Holding the pipe open holds
+    // the lock; ending it (or this process dying) closes the pipe, cat exits,
+    // and logind releases the inhibitor.
+    const child = spawn(
+      "systemd-inhibit",
+      [
+        "--what=sleep",
+        `--who=${WHO}`,
+        `--why=${WHY}`,
+        "--mode=block",
+        "cat",
+      ],
+      { stdio: ["pipe", "ignore", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr = (stderr + chunk).slice(-4096);
+    });
+    const exitState = Promise.withResolvers<void>();
+    const exited = exitState.promise;
+    child.once("exit", () => exitState.resolve());
+
+    const ready = Promise.withResolvers<string | null>();
+    let settled = false;
+    const settle = (message: string | null) => {
+      if (settled) return;
+      settled = true;
+      ready.resolve(message);
+    };
+    child.once("error", (cause) => settle(describe(cause)));
+    child.once("exit", (code, signal) =>
+      settle(
+        stderr.trim() ||
+          `systemd-inhibit exited (${code ?? signal ?? "unknown"})`,
+      ),
+    );
+    setTimeout(() => settle(null), READY_MS);
+    const failure = await ready.promise;
+
+    if (failure !== null) {
+      if (isRunning(child)) child.kill("SIGKILL");
+      await exited;
+      throw new Error(`cannot block suspend: ${failure}`);
+    }
+
+    // A lock that dies outside a toggle must not leave the UI reporting on.
+    const current: Inhibitor = { child, exited };
+    void exited.then(() => {
+      if (inhibitor !== current) return;
+      inhibitor = null;
+      enabled = false;
+      error = stderr.trim() || "systemd-inhibit stopped unexpectedly";
+      bb.log.warn(error);
+      void persist().then(() => bb.realtime.publish(CHANGED, snapshot()));
+    });
+    return current;
+  }
+
+  async function stop(current: Inhibitor): Promise<void> {
+    const { child, exited } = current;
+    if (!isRunning(child)) return;
+    // Graceful path: EOF on cat's stdin makes systemd-inhibit exit and drop
+    // the lock without a signal.
+    child.stdin?.end();
+    if (await waitFor(exited, END_STDIN_MS)) return;
+    child.kill("SIGTERM");
+    if (await waitFor(exited, TERM_MS)) return;
+    child.kill("SIGKILL");
+    if (await waitFor(exited, KILL_MS)) return;
+    throw new Error("systemd-inhibit did not stop; the sleep lock may persist");
+  }
+
+  const stored = await bb.storage.kv.get<{ enabled?: boolean }>(STATE_KEY);
   await serialize(async () => {
     enabled = stored?.enabled === true;
-    backend = stored?.backend ?? null;
-    cookie = stored?.cookie ?? null;
-    if (enabled) {
-      try {
-        const acquired = await acquire();
-        const previous = cookie;
-        const previousBackend = backend;
-        backend = acquired.backend;
-        cookie = acquired.cookie;
-        error = null;
-        if (previous !== null) {
-          try {
-            await release(previousBackend, previous);
-          } catch (cause) {
-            bb.log.warn(`could not release stale inhibitor: ${describe(cause)}`);
-          }
-        }
-      } catch (cause) {
-        error = describe(cause);
-        bb.log.warn(`could not inhibit idle: ${error}`);
-        if (cookie === null) {
-          enabled = false;
-          backend = null;
-        }
-      }
+    if (!enabled) return;
+    try {
+      inhibitor = await start();
+      error = null;
+    } catch (cause) {
+      // The intent stays stored: the next load or toggle retries it.
+      enabled = false;
+      inhibitor = null;
+      error = describe(cause);
+      bb.log.warn(error);
     }
-    await persist();
   });
 
   bb.rpc.register(rpcContract, {
-    idle_status: async () => snapshot(),
-    idle_set_enabled: ({ enabled: next }) =>
+    suspend_status: async () => snapshot(),
+    suspend_set_enabled: ({ enabled: next }) =>
       serialize(async () => {
         if (next) {
-          if (!enabled || cookie === null) {
+          if (!enabled || inhibitor === null) {
             try {
-              const acquired = await acquire();
+              inhibitor = await start();
               enabled = true;
-              backend = acquired.backend;
-              cookie = acquired.cookie;
               error = null;
             } catch (cause) {
+              inhibitor = null;
               enabled = false;
-              backend = null;
-              cookie = null;
               error = describe(cause);
             }
+          }
+        } else if (inhibitor !== null) {
+          const current = inhibitor;
+          inhibitor = null;
+          try {
+            await stop(current);
+            enabled = false;
+            error = null;
+          } catch (cause) {
+            // Still holding the lock: report on so the user can retry.
+            inhibitor = current;
+            enabled = true;
+            error = describe(cause);
           }
         } else {
-          if (cookie !== null) {
-            try {
-              await release(backend, cookie);
-              cookie = null;
-              backend = null;
-              enabled = false;
-              error = null;
-            } catch (cause) {
-              // The inhibitor is still held, so the toggle stays on and the
-              // user can retry; dispose attempts the release again.
-              error = describe(cause);
-            }
-          } else {
-            enabled = false;
-            backend = null;
-            error = null;
-          }
+          enabled = false;
+          error = null;
         }
         await persist();
         const status = snapshot();
@@ -260,22 +214,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.onDispose(async () => {
     await serialize(async () => {
-      if (cookie !== null) {
-        try {
-          await release(backend, cookie);
-        } catch (cause) {
-          bb.log.warn(`could not release inhibitor: ${describe(cause)}`);
-        }
-        cookie = null;
-        backend = null;
-        await persist();
-      }
-      if (bus !== null) {
-        bus.disconnect();
-        bus = null;
+      if (inhibitor === null) return;
+      const current = inhibitor;
+      inhibitor = null;
+      try {
+        await stop(current);
+      } catch (cause) {
+        bb.log.warn(describe(cause));
       }
     });
   });
 
-  bb.log.info("idle inhibitor ready");
+  bb.log.info("suspend inhibitor ready");
 }

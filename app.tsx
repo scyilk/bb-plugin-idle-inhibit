@@ -1,12 +1,12 @@
-// bb-plugin-idle-inhibit — puts a toggle in the thread and new-thread
-// composer action rows. The server owns the D-Bus inhibitor.
+// bb-plugin-idle-inhibit — puts a suspend toggle in the thread and new-thread
+// composer action rows. The server holds a systemd-logind sleep inhibitor.
 import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 
-function IdleInhibitToggle() {
+function SuspendInhibitToggle() {
   const rpc = useRpc<typeof rpcContract>();
   const [status, setStatus] = useState<{
     enabled: boolean;
@@ -16,7 +16,7 @@ function IdleInhibitToggle() {
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(() => {
-    rpc.call("idle_status").then(setStatus, (cause: unknown) => {
+    rpc.call("suspend_status").then(setStatus, (cause: unknown) => {
       setStatus({
         enabled: false,
         backend: null,
@@ -26,21 +26,21 @@ function IdleInhibitToggle() {
   }, [rpc]);
 
   useEffect(refresh, [refresh]);
-  // Another window or the CLI can change the same machine-wide inhibitor.
-  useRealtime("idle-inhibit-changed", refresh);
+  // Another window can change the same machine-wide inhibitor.
+  useRealtime("suspend-inhibit-changed", refresh);
 
   const enabled = status?.enabled === true;
   const error = status?.error ?? null;
   const label = error
-    ? `Idle inhibition failed: ${error}`
+    ? `Suspend inhibition failed: ${error}`
     : enabled
-      ? `Idle inhibition is on${status?.backend ? ` (${status.backend})` : ""}. Turn it off.`
-      : "Keep this computer awake. Turn idle inhibition on.";
+      ? `System suspend is blocked (${status?.backend ?? "logind"}). Screens may still turn off. Turn it off.`
+      : "Block system suspend while bb works. Screens may still turn off.";
 
   async function toggle() {
     setBusy(true);
     try {
-      setStatus(await rpc.call("idle_set_enabled", { enabled: !enabled }));
+      setStatus(await rpc.call("suspend_set_enabled", { enabled: !enabled }));
     } catch (cause) {
       setStatus({
         enabled,
@@ -66,7 +66,7 @@ function IdleInhibitToggle() {
         onClick={toggle}
       >
         <Icon name="Coffee" />
-        <span>Stay awake</span>
+        <span>Prevent sleep</span>
         {error ? (
           <Icon name="AlertTriangle" className="size-3.5 text-destructive" />
         ) : null}
@@ -77,8 +77,8 @@ function IdleInhibitToggle() {
 
 export default definePluginApp((app) => {
   app.composer.customize({
-    id: "idle-inhibit",
+    id: "suspend-inhibit",
     scopes: ["thread", "new-thread"],
-    actions: [{ id: "toggle", component: IdleInhibitToggle }],
+    actions: [{ id: "toggle", component: SuspendInhibitToggle }],
   });
 });

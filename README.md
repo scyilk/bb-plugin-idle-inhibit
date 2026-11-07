@@ -1,32 +1,37 @@
 # bb-plugin-idle-inhibit
 
-Keeps the Linux machine running bb awake while toggled on. The toggle lives in
-the thread and new-thread composer action rows, below the prompt.
+Blocks **system suspend** while toggled on. The toggle lives in the thread and
+new-thread composer action rows, below the prompt. Screen blanking and the
+screen saver are intentionally left alone: the inhibitor is the logind `sleep`
+lock, not `idle`.
 
 ## How it works
 
-`server.ts` registers two RPC methods and owns a D-Bus inhibitor cookie.
-Enabling tries, in order:
+The plugin spawns:
 
-1. `org.freedesktop.ScreenSaver` (`Inhibit`/`UnInhibit`) — KDE, Cinnamon, and
-   idle daemons such as hypridle or swayidle that expose the freedesktop
-   interface.
-2. `org.gnome.SessionManager` (`Inhibit`/`Uninhibit`, flags `8` = idle) — GNOME.
-3. `org.freedesktop.PowerManagement` (`Inhibit`/`UnInhibit`) — the freedesktop
-   power-management interface.
+```
+systemd-inhibit --what=sleep --who=bb-plugin-idle-inhibit \
+  --why="bb is keeping this machine awake" --mode=block cat
+```
 
-The first service that answers owns the inhibitor. Releasing calls that
-service's uninhibit method with the stored cookie. The enabled state and cookie
-are persisted in the plugin's key-value storage; on load the plugin acquires a
-fresh cookie and releases the previous one, so a reload never stacks
-inhibitors. `onDispose` releases the cookie when the plugin is disabled, the
-server shuts down, or the plugin reloads.
+`cat` inherits a pipe held by the bb server. Holding that pipe open holds a
+`block` inhibitor on suspend and hibernation. Ending the pipe — or the bb
+server exiting — closes it, `cat` sees EOF, and systemd-logind releases the
+lock. No cookie or file descriptor needs to survive a crash.
+
+The enabled state persists in the plugin's key-value storage. On load with the
+toggle on, the plugin acquires a fresh lock; `onDispose` releases it on plugin
+disable, reload, or server shutdown. A lock that dies unexpectedly flips the
+toggle back off and reports the reason.
+
+`org.freedesktop.ScreenSaver.Inhibit` is deliberately not used: it inhibits
+idle/screen blanking, which is not the same guarantee as blocking suspend.
 
 The toggle acts on the machine running the bb server, not on a remote client.
 
 ## Files
 
-- `server.ts` — D-Bus inhibition, RPC contract, persistence, disposal.
+- `server.ts` — systemd-inhibit lifecycle, RPC contract, persistence, disposal.
 - `app.tsx` — composer customization registering the toggle action.
 - `components/ui/` — vendored Button and Icon used by the action.
 

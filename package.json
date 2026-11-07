@@ -7,8 +7,8 @@
     "bbPluginSdk": ">=0.6.94"
   },
   "bb": {
-    "name": "Idle Inhibit",
-    "description": "Keeps this Linux machine awake while toggled on, through the D-Bus idle-inhibit interfaces.",
+    "name": "Suspend Inhibit",
+    "description": "Blocks system suspend through systemd-logind while toggled on. Screen blanking is unaffected.",
     "branding": {
       "icon": "Coffee"
     },
@@ -20,9 +20,7 @@
     "@radix-ui/react-slot": "^1.3.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "dbus-next": "^0.10.2",
     "tailwind-merge": "^3.4.0",
-    "x11": "^4.3.3",
     "zod": "^4.6.5"
   },
   "devDependencies": {
